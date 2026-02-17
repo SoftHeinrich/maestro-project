@@ -15,7 +15,7 @@ maestro-project/
 ├── maestro-search-engine/   # PyLucene full-text search + availability proxy
 ├── maestro-dl-manager/      # Deep learning training/prediction (Python + Rust)
 ├── maestro-ArchUI/          # React + Vite web frontend (Tailwind CSS)
-└── ArchitectureIssueRetrieval/  # Vector search research (FAISS + OpenAI embeddings)
+└── archRag/                 # Vector search API + evaluation (FAISS + OpenAI embeddings)
 ```
 
 Each subdirectory is its own git repository. They share a Docker network (`maestro_traefik`) and communicate via REST APIs through Traefik.
@@ -100,13 +100,62 @@ npm install && npm run dev       # local dev server
 npm run build                    # production build
 ```
 
-### ArchitectureIssueRetrieval
+### archRag (vector search)
 ```bash
-cd ArchitectureIssueRetrieval
-pip install -r requirements.txt
+cd archRag
+pip install -r requirements.txt && pip install -e .
+
+# Ingest issues into FAISS stores (all 3 chunking strategies)
 python -m app.main ingest --data-dir ./data/issues_texts --store-dir ./store
-python -m app.main query --store-dir ./store/token "your query"
+
+# Query a single strategy
+python -m app.main query --store-dir ./store/issue "data replication"
+
+# Run unit tests
+pytest tests/ -v
+
+# Run archRag API locally (port 8044)
+python -m api
+```
+
+### Full evaluation (RAG vs PyLucene vs Original)
+
+Compares three search systems using student experiment ground truth. Metrics: nDCG@k, P@k, MRR, First Hit Rank.
+
+**Prerequisites:**
+- FAISS stores built (`archRag/store/token/`, `sentence/`, `issue/`)
+- PyLucene service running (`docker ps | grep pylucene`)
+- OpenAI API key set (for embedding cache, one-time only)
+
+```bash
+cd archRag
+
+# Step 1: Cache query embeddings (one-time, calls OpenAI API)
+python -m eval.embed_queries --model-name text-embedding-3-small
+
+# Step 2a: Evaluate RAG strategies only (no live services needed)
 python -m eval.evaluate --store-dir store --data-dir data/issues_texts
+
+# Step 2b: Full comparison including live PyLucene API
+python -m eval.evaluate_all \
+    --store-dir store \
+    --data-dir data/issues_texts \
+    --pylucene-url http://localhost:8043
+
+# Options:
+#   --threshold 3        Relevance threshold (rating >= 3 = relevant)
+#   --exp-data PATH      Path to experiment JSON data
+#   --model-name NAME    OpenAI embedding model (must match store)
+```
+
+**Output:**
+```
+System           nDCG@5  nDCG@10    P@5    P@10     MRR     FHR   Unr@5  Unr@10
+original         0.7633   0.7200  0.7099  0.6273  0.8741    1.46    0.84    1.82
+pylucene         0.6514   0.6349  0.6262  0.5660  0.7725    1.89    1.11    2.24
+rag-token        0.8080   0.7396  0.7457  0.6218  0.8945    1.30    1.49    3.05
+rag-sentence     0.8189   0.7430  0.7497  0.6192  0.9058    1.25    1.53    3.14
+rag-issue        0.8712   0.7835  0.7953  0.6523  0.9366    1.15    1.41    2.91
 ```
 
 ## Architecture
@@ -118,6 +167,7 @@ All services sit behind a Traefik reverse proxy (port 4269) with TLS. Path-based
 - `/search-engine/` → Search availability proxy (8042)
 - `/pylucene/` → PyLucene search (8043)
 - `/dl-manager/` → Deep learning service (9011)
+- `/archrag/` → Vector search API (8044)
 
 ### Issues DB API (`maestro-issues-db/issues-db-api/`)
 FastAPI application with modular routers under `app/routers/`. JWT authentication. Uses MongoDB (issue data, predictions, ML models via GridFS) and PostgreSQL (relational data). Tests co-located with routers as `test_*.py` files using FastAPI TestClient.
@@ -137,8 +187,10 @@ PyLucene-based full-text search. The availability proxy (`search-proxy/`) provid
 ### Web UI (`maestro-ArchUI/src/`)
 React 18 + Vite + Tailwind CSS. Route-based structure under `src/routes/`, reusable components in `src/components/`. Connection settings stored in localStorage, defaults in `src/components/connectionSettings.tsx`. Served under base path `/archui/` (configured in `vite.config.js`).
 
-### ArchitectureIssueRetrieval (`ArchitectureIssueRetrieval/app/`)
-Strategy pattern with `ChunkingStrategy` ABC (token/sentence/issue-aware chunking). FAISS IndexFlatIP vector stores with L2-normalized OpenAI embeddings. See its own `CLAUDE.md` for details.
+### archRag (`archRag/`)
+- **app/**: Core library — chunking strategies (token/sentence/issue-aware), FAISS IndexFlatIP vector store, OpenAI embeddings, search aggregation
+- **api/**: FastAPI REST API (port 8044, Traefik path `/archrag`), loads FAISS store at startup, enriches results with issue metadata and classification labels from issues-db-api
+- **eval/**: Evaluation framework comparing RAG strategies, PyLucene, and original experiment results using nDCG, precision, MRR, and first hit rank
 
 ## Known Constraints
 
