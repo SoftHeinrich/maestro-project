@@ -1,0 +1,24 @@
+[submodule "archRag"]
+	path = archRag
+	url = git@github.com:Gram21/ArchitectureIssueRetrieval.git
+	branch = hy
+[submodule "maestro-ArchUI"]
+	path = maestro-ArchUI
+	url = git@github.com:SoftHeinrich/maestro-ArchUI.git
+	branch = hy
+[submodule "maestro-issues-db"]
+	path = maestro-issues-db
+	url = git@github.com:SoftHeinrich/maestro-issues-db.git
+	branch = hy
+[submodule "Maestro"]
+	path = Maestro
+	url = git@github.com:SoftHeinrich/Maestro.git
+	branch = hy
+[submodule "maestro-search-engine"]
+	path = maestro-search-engine
+	url = git@github.com:SoftHeinrich/maestro-search-engine.git
+	branch = hy
+[submodule "maestro-dl-manager"]
+	path = maestro-dl-manager
+	url = git@github.com:SoftHeinrich/maestro-dl-manager.git
+	branch = hy
