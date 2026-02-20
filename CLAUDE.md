@@ -51,6 +51,13 @@ cd Maestro && ./setup_components.sh
 # Restore MongoDB data (if you have the archives)
 docker exec -i mongo mongorestore --gzip --archive < maestro-issues-db/mongodump-MiningDesignDecisions-lite.archive
 docker exec -i mongo mongorestore --gzip --archive < maestro-issues-db/mongodump-JiraRepos_2023-03-07-16:00.archive
+
+# Restore PostgreSQL comments database
+gunzip -c maestro-issues-db/postgressCommentsdata.sql.gz | docker exec -i psql psql -U postgres -d issues
+
+# Create required index for comment lookups (critical for search performance)
+docker exec -i psql psql -U postgres -d issues -c \
+  "CREATE INDEX IF NOT EXISTS idx_issues_comments_issue_id ON issues_comments(issue_id);"
 ```
 
 ## Commands
@@ -187,8 +194,44 @@ All services sit behind a Traefik reverse proxy (port 4269) with TLS. Path-based
 - `/dl-manager/` → Deep learning service (9011)
 - `/archrag/` → Vector search API (8044)
 
+### Databases (`maestro-issues-db/`)
+
+Two databases run side-by-side in `maestro-issues-db/docker-compose.yml`:
+
+**MongoDB** (`mongo`, port 27017) — Issue metadata, ML models, predictions, tags, embeddings:
+- `MiningDesignDecisions` DB: `IssueLabels`, `DLModels`, `Tags`, `Projects`, `DLEmbeddings`, `Files`, `RepoInfo` collections
+- `JiraRepos` DB: One collection per ecosystem (e.g., `Apache`, `RedHat`) with raw Jira issue JSON
+- Data dumps: `mongodump-MiningDesignDecisions-lite.archive`, `mongodump-JiraRepos_2023-03-07-16:00.archive`
+- Admin UI: Mongo Express at `http://localhost:8081`
+
+**PostgreSQL** (`psql`, port 5432) — Issue comments and comment-level classification results:
+- Database: `issues`, user: `postgres`, password: `pass`
+- Data volume: Named Docker volume `pgdata` (persists across container restarts)
+- Data dump: `postgressCommentsdata.sql.gz` (~627 MB compressed)
+- Admin UI: Adminer at `http://localhost:8082` (default server: `psql`)
+
+PostgreSQL tables:
+| Table | Columns | Description |
+|-------|---------|-------------|
+| `issues_comments` | `id`, `issue_id`, `author_name`, `author_display_name`, `body`, `is_bot` | ~4M issue comments from Jira |
+| `classification_results` | `issue_comment_id`, `classification_result` | Comment-level ML predictions (existence/property/executive confidence scores) |
+
+The `classification_result` column stores JSON: `{"existence": {"confidence": 0.8}, "executive": {"confidence": 0.3}, "property": {"confidence": 0.5}}`.
+
+**Who uses PostgreSQL**: The PyLucene search engine (`maestro-search-engine/pylucene/app/adapter.py`) connects to PostgreSQL to:
+1. Fetch comments during index building — concatenates comment text into Lucene documents for full-text search
+2. Fetch comments + classification scores during search — used for reranking (Equation 3.1: weighted combination of text score, issue-level predictions, and comment-level predictions)
+
+The query filters comments to `LENGTH(body) > 200 AND is_bot = false`, then LEFT JOINs `classification_results` for confidence scores.
+
+**Connection config** (environment variables in `maestro-search-engine/docker-compose.yml`):
+```
+POSTGRES_HOST=psql    POSTGRES_PORT=5432
+POSTGRES_DB=issues    POSTGRES_USER=postgres    POSTGRES_PASSWORD=pass
+```
+
 ### Issues DB API (`maestro-issues-db/issues-db-api/`)
-FastAPI application with modular routers under `app/routers/`. JWT authentication. Uses MongoDB (issue data, predictions, ML models via GridFS) and PostgreSQL (relational data). Tests co-located with routers as `test_*.py` files using FastAPI TestClient.
+FastAPI application with modular routers under `app/routers/`. JWT authentication. Uses MongoDB (issue data, predictions, ML models via GridFS) and PostgreSQL (comments/classification via PyLucene). Tests co-located with routers as `test_*.py` files using FastAPI TestClient.
 
 ### Deep Learning Manager (`maestro-dl-manager/dl_manager/`)
 Largest codebase (~82 Python files). Key abstractions:
@@ -202,11 +245,7 @@ Runs as a FastAPI web server or CLI tool (`python -m dl_manager`).
 ### Search Engine (`maestro-search-engine/`)
 PyLucene-based full-text search with concurrent read support via a `ReadWriteLock` (multiple searches run in parallel; only index builds are exclusive). Supports prediction-filtered search with reranking using DL model classification confidence scores. The availability proxy (`search-proxy/`) provides an additional layer for the web UI.
 
-**PostgreSQL dependency**: The PyLucene service connects to the shared PostgreSQL database to fetch issue comments for reranking. Requires the index:
-```sql
-CREATE INDEX idx_issues_comments_issue_id ON issues_comments(issue_id);
-```
-Without this index, comment lookups do a sequential scan of ~4M rows (~277ms). With the index: ~0.1ms.
+**PostgreSQL dependency**: Connects to the shared PostgreSQL database (see Databases section above) to fetch issue comments for index building and reranking. Uses `psycopg2` with connection parameters from environment variables.
 
 **JVM threading**: PyLucene uses JCC (Java-C++ bridge). Call `lucene.initVM()` once per process, then `attachCurrentThread()` for additional threads. Never call `initVM()` per thread (causes SIGSEGV).
 
