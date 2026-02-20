@@ -207,7 +207,7 @@ Two databases run side-by-side in `maestro-issues-db/docker-compose.yml`:
 **PostgreSQL** (`psql`, port 5432) — Issue comments and comment-level classification results:
 - Database: `issues`, user: `postgres`, password: `pass`
 - Data volume: Named Docker volume `pgdata` (persists across container restarts)
-- Data dump: `postgressCommentsdata.sql.gz` (~627 MB compressed)
+- Data dump: `postgressCommentsdata.sql.gz` (~627 MB compressed), download from https://zenodo.org/records/14860796
 - Admin UI: Adminer at `http://localhost:8082` (default server: `psql`)
 
 PostgreSQL tables:
