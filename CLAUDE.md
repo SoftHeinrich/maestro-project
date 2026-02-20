@@ -120,12 +120,20 @@ python -m api
 
 ### Full evaluation (RAG vs PyLucene vs Original)
 
-Compares three search systems using student experiment ground truth. Metrics: nDCG@k, P@k, MRR, First Hit Rank.
+Compares 8 search systems using student experiment ground truth. Metrics: nDCG@k, P@k, MRR, First Hit Rank.
+
+**Systems evaluated:**
+- `original` — student experiment results (baseline)
+- `pylucene` — raw query, no prediction filtering
+- `pylucene_gpt` — GPT-4o-mini keyword extraction (5 keywords), no prediction filtering
+- `pylucene_rerank` — raw query, with ADD type prediction reranking
+- `pylucene_rerank_gpt` — GPT keywords + prediction reranking
+- `rag-token`, `rag-sentence`, `rag-issue` — FAISS vector search with 3 chunking strategies
 
 **Prerequisites:**
 - FAISS stores built (`archRag/store/token/`, `sentence/`, `issue/`)
 - PyLucene service running (`docker ps | grep pylucene`)
-- OpenAI API key set (for embedding cache, one-time only)
+- OpenAI API key set in `archRag/.env` (for embeddings + GPT keyword extraction)
 
 ```bash
 cd archRag
@@ -137,6 +145,9 @@ python -m eval.embed_queries --model-name text-embedding-3-small
 python -m eval.evaluate --store-dir store --data-dir data/issues_texts
 
 # Step 2b: Full comparison including live PyLucene API
+# Phase 1: GPT keyword extraction (cached after first run)
+# Phase 2: Pre-fetch PyLucene results (cached to disk, resumable)
+# Phase 3: Evaluate all 8 systems
 python -m eval.evaluate_all \
     --store-dir store \
     --data-dir data/issues_texts \
@@ -146,17 +157,24 @@ python -m eval.evaluate_all \
 #   --threshold 3        Relevance threshold (rating >= 3 = relevant)
 #   --exp-data PATH      Path to experiment JSON data
 #   --model-name NAME    OpenAI embedding model (must match store)
+#   --skip-pylucene      Evaluate only RAG systems
+#   --fetch-only         Only pre-fetch PyLucene results, don't evaluate
 ```
 
 **Output:**
 ```
-System           nDCG@5  nDCG@10    P@5    P@10     MRR     FHR   Unr@5  Unr@10
-original         0.7633   0.7200  0.7099  0.6273  0.8741    1.46    0.84    1.82
-pylucene         0.6514   0.6349  0.6262  0.5660  0.7725    1.89    1.11    2.24
-rag-token        0.8080   0.7396  0.7457  0.6218  0.8945    1.30    1.49    3.05
-rag-sentence     0.8189   0.7430  0.7497  0.6192  0.9058    1.25    1.53    3.14
-rag-issue        0.8712   0.7835  0.7953  0.6523  0.9366    1.15    1.41    2.91
+System                   nDCG@5  nDCG@10      P@5     P@10      MRR      FHR    Unr@5   Unr@10
+original                 0.7633   0.7409   0.7572   0.7281   0.8636     1.43     0.00     0.00
+pylucene                 0.6866   0.6838   0.6791   0.6918   0.8137     1.40     2.12     4.72
+pylucene_gpt             0.7649   0.7582   0.7549   0.7563   0.8865     1.36     1.99     4.36
+pylucene_rerank          0.6636   0.6653   0.6614   0.6776   0.7966     1.48     1.99     4.61
+pylucene_rerank_gpt      0.7376   0.7311   0.7341   0.7299   0.8553     1.45     1.87     4.29
+rag-token                0.8557   0.8157   0.8496   0.8257   0.9368     1.16     3.01     6.43
+rag-sentence             0.8597   0.8233   0.8543   0.8332   0.9434     1.15     2.99     6.33
+rag-issue                0.8713   0.8397   0.8645   0.8455   0.9413     1.14     2.85     5.98
 ```
+
+**Caching**: PyLucene results are cached to `eval/cache/pylucene_results.json`. If the process crashes, restart and it resumes from where it left off. GPT keywords are cached to `eval/cache/gpt_keywords.json`.
 
 ## Architecture
 
@@ -182,7 +200,15 @@ Largest codebase (~82 Python files). Key abstractions:
 Runs as a FastAPI web server or CLI tool (`python -m dl_manager`).
 
 ### Search Engine (`maestro-search-engine/`)
-PyLucene-based full-text search. The availability proxy (`search-proxy/`) provides mutual exclusion for concurrent index/search requests. Supports prediction-filtered search using DL model outputs.
+PyLucene-based full-text search with concurrent read support via a `ReadWriteLock` (multiple searches run in parallel; only index builds are exclusive). Supports prediction-filtered search with reranking using DL model classification confidence scores. The availability proxy (`search-proxy/`) provides an additional layer for the web UI.
+
+**PostgreSQL dependency**: The PyLucene service connects to the shared PostgreSQL database to fetch issue comments for reranking. Requires the index:
+```sql
+CREATE INDEX idx_issues_comments_issue_id ON issues_comments(issue_id);
+```
+Without this index, comment lookups do a sequential scan of ~4M rows (~277ms). With the index: ~0.1ms.
+
+**JVM threading**: PyLucene uses JCC (Java-C++ bridge). Call `lucene.initVM()` once per process, then `attachCurrentThread()` for additional threads. Never call `initVM()` per thread (causes SIGSEGV).
 
 ### Web UI (`maestro-ArchUI/src/`)
 React 18 + Vite + Tailwind CSS. Route-based structure under `src/routes/`, reusable components in `src/components/`. Connection settings stored in localStorage, defaults in `src/components/connectionSettings.tsx`. Served under base path `/archui/` (configured in `vite.config.js`).
@@ -190,7 +216,7 @@ React 18 + Vite + Tailwind CSS. Route-based structure under `src/routes/`, reusa
 ### archRag (`archRag/`)
 - **app/**: Core library — chunking strategies (token/sentence/issue-aware), FAISS IndexFlatIP vector store, OpenAI embeddings, search aggregation
 - **api/**: FastAPI REST API (port 8044, Traefik path `/archrag`), loads FAISS store at startup, enriches results with issue metadata and classification labels from issues-db-api
-- **eval/**: Evaluation framework comparing RAG strategies, PyLucene, and original experiment results using nDCG, precision, MRR, and first hit rank
+- **eval/**: Evaluation framework comparing 8 systems (3 RAG strategies, 4 PyLucene variants, original). Uses GPT-4o-mini for keyword extraction, disk caching for PyLucene results (resumable after crashes), and handles Lucene ParseException for special-character queries
 
 ## Known Constraints
 
@@ -200,3 +226,5 @@ React 18 + Vite + Tailwind CSS. Route-based structure under `src/routes/`, reusa
 - **Base images**: Use `*-bookworm` not `*-buster` (Debian Buster is EOL)
 - **Config secret**: `maestro-issues-db/issues-db-api/app/config.py` must contain `SECRET_KEY` (generated via `openssl rand -hex 32`)
 - **Self-signed TLS**: DL Manager needs `DL_MANAGER_ALLOW_SELF_SIGNED_CERTIFICATE=TRUE` env var for local deployment
+- **PostgreSQL index**: `issues_comments.issue_id` must be indexed for PyLucene reranking performance (`CREATE INDEX idx_issues_comments_issue_id ON issues_comments(issue_id)`)
+- **PyLucene JVM**: Never call `lucene.initVM()` per thread — call once, then `attachCurrentThread()` for additional threads
